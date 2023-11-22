@@ -32,6 +32,47 @@ from fastchat.model.model_adapter import get_conversation_template
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
+import torch.nn as nn
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+
+class CustomTrainer(Trainer):
+    def _get_collator_with_removed_columns(
+        self, data_collator: Callable, description: Optional[str] = None
+    ) -> Callable:
+        return data_collator
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        reward_weights = inputs.pop("reward_weights")
+        for key in inputs.keys():
+            num_of_samples = inputs[key].shape[0]
+            break
+        sample_loss = []
+        sample_token = []
+        for i in range(num_of_samples):
+            sample = {}
+            for key in inputs.keys():
+                sample[key] = inputs[key][i:i+1]
+            num_of_tokens = sum(inputs['attention_mask'][i])
+            if return_outputs: 
+                loss, outputs = super().compute_loss(model, sample, return_outputs)
+            else:
+                loss = super().compute_loss(model, sample, return_outputs)
+            sample_loss.append(loss)
+            sample_token.append(len(inputs['attention_mask'][i]))
+        log = {
+            "sample_loss": sample_loss
+        }
+        sample_loss_tensor = torch.stack(sample_loss).to(reward_weights.device)
+        reward_weights_reshaped = reward_weights.view(-1)
+        weighted_loss = sample_loss_tensor * reward_weights_reshaped
+        average_weighted_loss = weighted_loss.mean()
+
+        # print(f"sample_loss_tensor: {sample_loss_tensor}")
+        # print(f"reward_weights_reshaped: {reward_weights_reshaped}")
+        # print(f"weighted_loss: {weighted_loss}")
+        # print(f"average_weighted_loss: {average_weighted_loss}")     
+
+        return (average_weighted_loss, outputs) if return_outputs else average_weighted_loss
 
 @dataclass
 class ModelArguments:
@@ -86,20 +127,31 @@ def preprocess(
 ) -> Dict:
     conv = get_conversation_template("vicuna")
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
-
+    total_num_of_data = len(sources)
+    valid_num_of_data = 0
     # Apply prompt templates
     conversations = []
+    losses = []
     for i, source in enumerate(sources):
         if roles[source[0]["from"]] != conv.roles[0]:
             # Skip the first one if it is not from human
             source = source[1:]
 
         conv.messages = []
+        losses_for_one_interaction = []
         for j, sentence in enumerate(source):
             role = roles[sentence["from"]]
             assert role == conv.roles[j % 2], f"{i}"
             conv.append_message(role, sentence["value"])
+            losses_for_one_interaction.append(sentence["loss"])
+
         conversations.append(conv.get_prompt())
+        losses.append(losses_for_one_interaction)
+
+    # print(f"shape of conversations: {len(conversations)}")
+    # print(f"example of conversations[0]: {conversations[0]}")  
+    # print(f"shape of losses: {len(losses)}")
+    # print(f"example of loss[0]: {losses[0]}")  
 
     # Tokenize conversations
     input_ids = tokenizer(
@@ -110,24 +162,36 @@ def preprocess(
         truncation=True,
     ).input_ids
     targets = input_ids.clone()
+    
+    reward_weights = None
 
     assert conv.sep_style == SeparatorStyle.ADD_COLON_TWO
 
     # Mask targets. Only compute loss on the assistant outputs.
     sep = conv.sep + conv.roles[1] + ": "
-    for conversation, target in zip(conversations, targets):
+    for idx, (conversation, target) in enumerate(zip(conversations, targets)):
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
-
         turns = conversation.split(conv.sep2)
+        if turns[-1] == "":
+            turns = turns[:-1]
+        # turns = conversation.split(sep)
         cur_len = 1
         target[:cur_len] = IGNORE_TOKEN_ID
+
         for i, turn in enumerate(turns):
             if turn == "":
+                print("Turn is empty")
+                print(conversation)
+                print(turns)
+                print("===============================")
                 break
             turn_len = len(tokenizer(turn).input_ids)
 
             parts = turn.split(sep)
             if len(parts) != 2:
+                print("Parts are not 2")
+                print(parts)
+                print("===============================")
                 break
             parts[0] += sep
             # "-2" is hardcoded for the Llama tokenizer to make the offset correct.
@@ -139,6 +203,12 @@ def preprocess(
 
             # Ignore the user instructions
             target[cur_len : cur_len + instruction_len] = IGNORE_TOKEN_ID
+            # if sources[idx][2*i+1]["from"] == "gpt":
+            #     loss = sources[idx][2*i+1]["loss"]
+            #     value = sources[idx][2*i+1]["value"]
+            #     print(f"{loss}: {value}")
+            if sources[idx][2*i+1]["loss"] == 0.0:
+                target[cur_len + instruction_len : cur_len + turn_len] = IGNORE_TOKEN_ID
             cur_len += turn_len
 
             if i != 0 and not tokenizer.legacy:
@@ -146,25 +216,34 @@ def preprocess(
                 cur_len -= 1
 
         target[cur_len:] = IGNORE_TOKEN_ID
+        if reward_weights == None:
+            reward_weights = [[sources[idx][-1]["loss"]]]
+        else:
+            reward_weights.append([sources[idx][-1]["loss"]])
 
         if False:  # Inspect and check the correctness of masking
             z = target.clone()
             z = torch.where(z == IGNORE_TOKEN_ID, tokenizer.unk_token_id, z)
             rank0_print(tokenizer.decode(z))
             exit()
-
         if cur_len < tokenizer.model_max_length:
             if cur_len != total_len:
+                
                 target[:] = IGNORE_TOKEN_ID
                 rank0_print(
                     f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
                     f" #turn = {len(turns) - 1}. (ignored)"
                 )
+            else:
+                valid_num_of_data += 1
+        
+    print(f"Valid data portion: {valid_num_of_data}/{total_num_of_data}")
 
     return dict(
         input_ids=input_ids,
         labels=targets,
         attention_mask=input_ids.ne(tokenizer.pad_token_id),
+        reward_weights=torch.tensor(reward_weights)
     )
 
 
@@ -174,13 +253,14 @@ class SupervisedDataset(Dataset):
     def __init__(self, raw_data, tokenizer: transformers.PreTrainedTokenizer):
         super(SupervisedDataset, self).__init__()
 
-        rank0_print("Formatting inputs...")
+        rank0_print("Supervised Dataset Formatting inputs...")
         sources = [example["conversations"] for example in raw_data]
         data_dict = preprocess(sources, tokenizer)
 
         self.input_ids = data_dict["input_ids"]
         self.labels = data_dict["labels"]
         self.attention_mask = data_dict["attention_mask"]
+        self.reward_weights = data_dict["reward_weights"]
 
     def __len__(self):
         return len(self.input_ids)
@@ -190,6 +270,7 @@ class SupervisedDataset(Dataset):
             input_ids=self.input_ids[i],
             labels=self.labels[i],
             attention_mask=self.attention_mask[i],
+            reward_weights=self.reward_weights[i]
         )
 
 
@@ -217,6 +298,7 @@ class LazySupervisedDataset(Dataset):
             input_ids=ret["input_ids"][0],
             labels=ret["labels"][0],
             attention_mask=ret["attention_mask"][0],
+            reward_weights=ret["reward_weights"][0]
         )
         self.cached_data_dict[i] = ret
 
@@ -283,7 +365,7 @@ def train():
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
 
     # Start trainner
-    trainer = Trainer(
+    trainer = CustomTrainer(
         model=model, tokenizer=tokenizer, args=training_args, **data_module
     )
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
@@ -294,10 +376,7 @@ def train():
     # Save model
     model.config.use_cache = True
     trainer.save_state()
-    if trainer.is_deepspeed_enabled:
-        trainer.save_model()
-    else:
-        trainer_save_model_safe(trainer)
+    trainer_save_model_safe(trainer)
 
 
 if __name__ == "__main__":
